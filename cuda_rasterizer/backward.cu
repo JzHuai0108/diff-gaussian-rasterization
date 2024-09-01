@@ -396,23 +396,31 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C,uint32_t MAP_N>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	float fx, float fy,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ all_maps,
+	const float* __restrict__ all_map_pixels,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dout_all_maps,
+	const float* __restrict__ dL_dout_plane_depths,
 	float3* __restrict__ dL_dmean2D,
+	float3* __restrict__ dL_dmean2D_abs,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_dall_map,
+	const bool render_geo)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -422,6 +430,7 @@ renderCUDA(
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float2 pixf = { (float)pix.x, (float)pix.y };
+	const float2 ray = { (pixf.x - W * 0.5) / fx, (pixf.y - H * 0.5) / fy };
 
 	const bool inside = pix.x < W&& pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -435,6 +444,7 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_all_maps[MAP_N * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -447,13 +457,37 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+	float accum_all_map[MAP_N] = { 0 };
 	float dL_dpixel[C];
-	if (inside)
-		for (int i = 0; i < C; i++)
+	float dL_dout_all_map[MAP_N];
+	// float grad_sum = 0;
+	if (inside) {
+		for (int i = 0; i < C; i++) {
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+			// grad_sum += fabs(dL_dpixel[i]);
+		}
+		if(render_geo) {
+			for (int i = 0; i < MAP_N; i++) {
+				dL_dout_all_map[i] = dL_dout_all_maps[i * H * W + pix_id];
+				// grad_sum += fabs(dL_dout_all_map[i]);
+			}
+			const float3 normal = {all_map_pixels[pix_id], all_map_pixels[H * W + pix_id], all_map_pixels[2 * H * W + pix_id]};
+			const float distance = all_map_pixels[4 * H * W + pix_id];
+			const float tmp = (normal.x * ray.x + normal.y * ray.y + normal.z + 1.0e-8);
+			dL_dout_all_map[MAP_N-1] += (-dL_dout_plane_depths[pix_id] / tmp);
+			dL_dout_all_map[0] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp) * ray.x);
+			dL_dout_all_map[1] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp) * ray.y);
+			dL_dout_all_map[2] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp));
+		}
+	}
+	// If grad is too small, skip
+	// if (grad_sum < 0.000001f) {
+	// 	done = true;
+	// }
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
+	float last_all_map[MAP_N] = { 0 };
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -475,6 +509,10 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			if (render_geo) {
+				for (int i = 0; i < MAP_N; i++)
+					collected_all_maps[i * BLOCK_SIZE + block.thread_rank()] = all_maps[coll_id * MAP_N + i];
+			}
 		}
 		block.sync();
 
@@ -522,6 +560,23 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+			if (render_geo) {
+				for (int ch = 0; ch < MAP_N; ch++)
+				{
+					const float c = collected_all_maps[ch * BLOCK_SIZE + j];
+					// Update last color (to be used in the next iteration)
+					accum_all_map[ch] = last_alpha * last_all_map[ch] + (1.f - last_alpha) * accum_all_map[ch];
+					last_all_map[ch] = c;
+
+					const float dL_dchannel = dL_dout_all_map[ch];
+					dL_dalpha += (c - accum_all_map[ch]) * dL_dchannel;
+					// Update the gradients w.r.t. color of the Gaussian. 
+					// Atomic, since this pixel is just one of potentially
+					// many that were affected by this Gaussian.
+					atomicAdd(&(dL_dall_map[global_id * MAP_N + ch]), dchannel_dcolor * dL_dchannel);
+				}
+			}
+			
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
@@ -544,6 +599,8 @@ renderCUDA(
 			// Update gradients w.r.t. 2D mean position of the Gaussian
 			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
 			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+			atomicAdd(&dL_dmean2D_abs[global_id].x, fabs(dL_dG * dG_ddelx * ddelx_dx));
+			atomicAdd(&dL_dmean2D_abs[global_id].y, fabs(dL_dG * dG_ddely * ddely_dy));
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
 			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
@@ -626,32 +683,48 @@ void BACKWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	float fx, float fy,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* all_maps,
+	const float* all_map_pixels,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_dout_all_map,
+	const float* dL_dout_plane_depth,
 	float3* dL_dmean2D,
+	float3* dL_dmean2D_abs,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float* dL_dall_map,
+	const bool render_geo)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS,NUM_ALL_MAP> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
+		fx, fy,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
+		all_maps,
+		all_map_pixels,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_dout_all_map,
+		dL_dout_plane_depth,
 		dL_dmean2D,
+		dL_dmean2D_abs,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_dall_map,
+		render_geo
 		);
 }
