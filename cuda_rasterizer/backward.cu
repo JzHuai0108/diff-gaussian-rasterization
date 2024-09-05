@@ -1,4 +1,4 @@
-/*
+///*
  * Copyright (C) 2023, Inria
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
@@ -560,26 +560,34 @@ __device__ void render_cuda_reduce_sum(group_t g, Lists... lists) {
 
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C,uint32_t MAP_N>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	float fx, float fy,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
+	const float* __restrict__ all_maps,
+	const float* __restrict__ all_map_pixels,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixels_depth,
+	const float* __restrict__ dL_dout_all_maps,
+	const float* __restrict__ dL_dout_plane_depths,
 	float3* __restrict__ dL_dmean2D,
+	float3* __restrict__ dL_dmean2D_abs,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_ddepths)
+	float* __restrict__ dL_ddepths,
+	float* __restrict__ dL_dall_map,
+	const bool render_geo)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -591,6 +599,7 @@ renderCUDA(
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float2 pixf = { (float)pix.x, (float)pix.y };
+	const float2 ray = { (pixf.x - W * 0.5) / fx, (pixf.y - H * 0.5) / fy };
 
 	const bool inside = pix.x < W&& pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -605,6 +614,7 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float collected_depths[BLOCK_SIZE];
+	__shared__ float collected_all_maps[MAP_N * BLOCK_SIZE];
 
 	__shared__ float2 dL_dmean2D_shared[BLOCK_SIZE];
 	__shared__ float3 dL_dcolors_shared[BLOCK_SIZE];
@@ -623,20 +633,42 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
+	float accum_all_map[MAP_N] = { 0 };
 	float dL_dpixel[C] = { 0 };
+	float dL_dout_all_map[MAP_N];
 	float accum_rec_depth = 0;
 	float dL_dpixel_depth = 0;
+	// float grad_sum = 0;
 	if (inside) {
 		#pragma unroll
 		for (int i = 0; i < C; i++) {
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+			// grad_sum += fabs(dL_dpixel[i]);
 		}
 		dL_dpixel_depth = dL_dpixels_depth[pix_id];
+		if(render_geo) {
+			for (int i = 0; i < MAP_N; i++) {
+				dL_dout_all_map[i] = dL_dout_all_maps[i * H * W + pix_id];
+				// grad_sum += fabs(dL_dout_all_map[i]);
+			}
+			const float3 normal = {all_map_pixels[pix_id], all_map_pixels[H * W + pix_id], all_map_pixels[2 * H * W + pix_id]};
+			const float distance = all_map_pixels[4 * H * W + pix_id];
+			const float tmp = (normal.x * ray.x + normal.y * ray.y + normal.z + 1.0e-8);
+			dL_dout_all_map[MAP_N-1] += (-dL_dout_plane_depths[pix_id] / tmp);
+			dL_dout_all_map[0] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp) * ray.x);
+			dL_dout_all_map[1] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp) * ray.y);
+			dL_dout_all_map[2] += dL_dout_plane_depths[pix_id] * (distance / (tmp * tmp));
+		}
 	}
+	// If grad is too small, skip
+	// if (grad_sum < 0.000001f) {
+	// 	done = true;
+	// }
 
 	float last_alpha = 0.f;
 	float last_color[C] = { 0.f };
 	float last_depth = 0.f;
+	float last_all_map[MAP_N] = { 0 };
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -660,9 +692,12 @@ renderCUDA(
 			#pragma unroll
 			for (int i = 0; i < C; i++) {
 				collected_colors[i * BLOCK_SIZE + tid] = colors[coll_id * C + i];
-				
 			}
 			collected_depths[tid] = depths[coll_id];
+			if (render_geo) {
+				for (int i = 0; i < MAP_N; i++)
+					collected_all_maps[i * BLOCK_SIZE + block.thread_rank()] = all_maps[coll_id * MAP_N + i];
+			}
 		}
 		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++) {
 			block.sync();
@@ -722,13 +757,34 @@ renderCUDA(
 			dL_dcolors_shared[tid].y = local_dL_dcolors[1];
 			dL_dcolors_shared[tid].z = local_dL_dcolors[2];
 
-			const float depth = collected_depths[j];
-			accum_rec_depth = skip ? accum_rec_depth : last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
-			last_depth = skip ? last_depth : depth;
-			dL_dalpha += (depth - accum_rec_depth) * dL_dpixel_depth;
-			dL_ddepths_shared[tid] = skip ? 0.f : dchannel_dcolor * dL_dpixel_depth;
+			if (render_geo) {
+				for (int ch = 0; ch < MAP_N; ch++)
+				{
+					const float c = collected_all_maps[ch * BLOCK_SIZE + j];
+					// Update last color (to be used in the next iteration)
+					accum_all_map[ch] = skip ? accum_all_map[ch] : last_alpha * last_all_map[ch] + (1.f - last_alpha) * accum_all_map[ch];
+					last_all_map[ch] = skip ? last_all_map[ch] : c;
 
-
+					const float dL_dchannel = dL_dout_all_map[ch];
+					dL_dalpha += (c - accum_all_map[ch]) * dL_dchannel;
+					// Update the gradients w.r.t. color of the Gaussian. 
+					// Atomic, since this pixel is just one of potentially
+					// many that were affected by this Gaussian.
+					atomicAdd(&(dL_dall_map[global_id * MAP_N + ch]), skip ? 0.0f : dchannel_dcolor * dL_dchannel);
+				}
+                // the above geometric channels have included depth, we just fill the values for depths.
+                const float depth = collected_depths[j];
+			    accum_rec_depth = skip ? accum_rec_depth : last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
+			    last_depth = skip ? last_depth : depth;
+			    // dL_dalpha += (depth - accum_rec_depth) * dL_dpixel_depth; // This has been done for depth in the above geometric channels.
+			    dL_ddepths_shared[tid] = skip ? 0.f : dchannel_dcolor * dL_dpixel_depth;
+			} else { // only render depth
+			    const float depth = collected_depths[j];
+			    accum_rec_depth = skip ? accum_rec_depth : last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
+			    last_depth = skip ? last_depth : depth;
+			    dL_dalpha += (depth - accum_rec_depth) * dL_dpixel_depth;
+			    dL_ddepths_shared[tid] = skip ? 0.f : dchannel_dcolor * dL_dpixel_depth;
+            }
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = skip ? last_alpha : alpha;
@@ -755,6 +811,9 @@ renderCUDA(
 			dL_dconic2D_shared[tid].y = skip ? 0.f : -0.5f * gdx * d.y * dL_dG;
 			dL_dconic2D_shared[tid].w = skip ? 0.f : -0.5f * gdy * d.y * dL_dG;
 			dL_dopacity_shared[tid] = skip ? 0.f : G * dL_dalpha;
+            
+			atomicAdd(&dL_dmean2D_abs[global_id].x, skip ? 0.f : fabs(dL_dG * dG_ddelx * ddelx_dx));  // TODO: should we remove dL_dmean2D_abs? If not, use dL_dmean2D_abs_shared?
+			atomicAdd(&dL_dmean2D_abs[global_id].y, skip ? 0.f : fabs(dL_dG * dG_ddely * ddely_dy));
 
 			render_cuda_reduce_sum(block, 
 				dL_dmean2D_shared,
@@ -864,38 +923,54 @@ void BACKWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	float fx, float fy,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
 	const float* depths,
+	const float* all_maps,
+	const float* all_map_pixels,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_dpixels_depth,
+	const float* dL_dout_all_map,
+	const float* dL_dout_plane_depth,
 	float3* dL_dmean2D,
+	float3* dL_dmean2D_abs,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_ddepths)
+	float* dL_ddepths,
+	float* dL_dall_map,
+	const bool render_geo)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	renderCUDA<NUM_CHANNELS,NUM_ALL_MAP> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
+		fx, fy,
 		bg_color,
 		means2D,
 		conic_opacity,
 		colors,
 		depths,
+		all_maps,
+		all_map_pixels,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
 		dL_dpixels_depth,
+		dL_dout_all_map,
+		dL_dout_plane_depth,
 		dL_dmean2D,
+		dL_dmean2D_abs,
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
 		dL_ddepths
-	);
+		dL_dall_map,
+		render_geo
+		);
 }

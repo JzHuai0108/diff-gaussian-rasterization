@@ -248,6 +248,18 @@ __global__ void preprocessCUDA(int P, int D, int M,
 		rgb[idx * C + 2] = result.z;
 	}
 
+	// if (opacities[idx] > 0.9 && point_image.x > 0 && point_image.x < 1264 && point_image.y > 0 && point_image.y < 832) {
+	// 	glm::vec4 q = rotations[idx];
+	// 	glm::vec3 cp = *cam_pos;
+	// 	printf("q(wxyz) %lf %lf %lf %lf, scale %lf %lf %lf, mean3d %lf %lf %lf, c %lf %lf %lf\n viewmatrix %lf %lf %lf %lf, %lf %lf %lf %lf, %lf %lf %lf %lf, %lf %lf %lf %lf\n", 
+	// 		q.x, q.y, q.z, q.w, scales[idx].x, scales[idx].y, scales[idx].z,
+	// 		p_orig.x, p_orig.y, p_orig.z, cp.x, cp.y, cp.z, 
+	// 		viewmatrix[0],viewmatrix[4],viewmatrix[8],viewmatrix[12],
+	// 		viewmatrix[1],viewmatrix[5],viewmatrix[9],viewmatrix[13],
+	// 		viewmatrix[2],viewmatrix[6],viewmatrix[10],viewmatrix[14],
+	// 		viewmatrix[3],viewmatrix[7],viewmatrix[11],viewmatrix[15]);
+	// }
+
 	// Store some useful helper data for the next steps.
 	depths[idx] = p_view.z;
 	radii[idx] = my_radius;
@@ -260,14 +272,19 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t ALL_MAP>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	const float focal_x, const float focal_y,
+	const float cx, const float cy,
+	const float* __restrict__ viewmatrix,
+	const float* __restrict__ cam_pos,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ all_map,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
@@ -276,18 +293,20 @@ renderCUDA(
 	const float* __restrict__ depth,
 	float* __restrict__ out_depth, 
 	float* __restrict__ out_opacity,
-	int * __restrict__ n_touched)
+	int * __restrict__ n_touched,
+	float* __restrict__ out_all_map,
+	float* __restrict__ out_plane_depth,
+	const bool render_geo)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
     uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	// uint32_t horizontal_blocks = gridDim.x; # TODO Maybe it's different?
 	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
 	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
-
+	const float2 ray = { (pixf.x - cx) / focal_x, (pixf.y - cy) / focal_y };
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
@@ -310,6 +329,7 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 	float D = 0.0f;
+	float All_map[ALL_MAP] = { 0 };
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -336,7 +356,6 @@ renderCUDA(
 		{
 			// Keep track of current position in range
 			contributor++;
-
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
@@ -365,6 +384,10 @@ renderCUDA(
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 			}
 			D += collected_depth[j] * alpha * T;
+			if (render_geo) {
+				for (int ch = 0; ch < ALL_MAP; ch++)
+					All_map[ch] += all_map[collected_id[j] * ALL_MAP + ch] * alpha * T;
+			}
 			// Keep track of how many pixels touched this Gaussian.
 			if (test_T > 0.5f) {
 				atomicAdd(&(n_touched[collected_id[j]]), 1);
@@ -388,6 +411,11 @@ renderCUDA(
 		}
 		out_depth[pix_id] = D;
 		out_opacity[pix_id] = 1 - T;
+		if (render_geo) {
+			for (int ch = 0; ch < ALL_MAP; ch++)
+				out_all_map[ch * H * W + pix_id] = All_map[ch];
+			out_plane_depth[pix_id] = All_map[4] / -(All_map[0] * ray.x + All_map[1] * ray.y + All_map[2] + 1.0e-8);
+		}
 	}
 }
 
@@ -396,8 +424,13 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	const float focal_x, const float focal_y,
+	const float cx, const float cy,
+	const float* viewmatrix,
+	const float* cam_pos,
 	const float2* means2D,
 	const float* colors,
+	const float* all_map,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
@@ -406,14 +439,22 @@ void FORWARD::render(
 	const float* depth,
 	float* out_depth, 
 	float* out_opacity,
-	int* n_touched)
+	int* n_touched,
+	float* out_all_map,
+	float* out_plane_depth,
+	const bool render_geo)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS,NUM_ALL_MAP> << <grid, block >> > (
 		ranges,
 		point_list,
 		W, H,
+		focal_x, focal_y,
+		cx, cy,
+		viewmatrix,
+		cam_pos,
 		means2D,
 		colors,
+		all_map,
 		conic_opacity,
 		final_T,
 		n_contrib,
@@ -422,7 +463,10 @@ void FORWARD::render(
 		depth,
 		out_depth,
 		out_opacity,
-		n_touched);
+		n_touched,
+		out_all_map,
+		out_plane_depth,
+		render_geo);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

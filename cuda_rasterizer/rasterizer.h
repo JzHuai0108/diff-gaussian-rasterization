@@ -43,6 +43,7 @@ namespace CudaRasterizer
 			const float scale_modifier,
 			const float* rotations,
 			const float* cov3D_precomp,
+			const float* all_map,
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float* cam_pos,
@@ -53,15 +54,20 @@ namespace CudaRasterizer
 			float* out_opacity,
 			int* radii = nullptr,
 			int* n_touched = nullptr,
+			float* out_all_map,
+			float* out_plane_depth,
+			const bool render_geo,
 			bool debug = false);
 
 		static void backward(
 			const int P, int D, int M, int R,
 			const float* background,
+			const float* all_map_pixels,
 			const int width, int height,
 			const float* means3D,
 			const float* shs,
 			const float* colors_precomp,
+			const float* all_maps,
 			const float* scales,
 			const float scale_modifier,
 			const float* rotations,
@@ -77,7 +83,10 @@ namespace CudaRasterizer
 			char* image_buffer,
 			const float* dL_dpix,
 			const float* dL_dpix_depth,
+			const float* dL_dout_all_map,
+			const float* dL_dout_plane_depth,
 			float* dL_dmean2D,
+			float* dL_dmean2D_abs,
 			float* dL_dconic,
 			float* dL_dopacity,
 			float* dL_dcolor,
@@ -88,6 +97,8 @@ namespace CudaRasterizer
 			float* dL_dscale,
 			float* dL_drot,
 			float* dL_dtau,
+			float* dL_dall_map,
+			const bool render_geo,
 			bool debug);
 	};
 };
