@@ -444,7 +444,7 @@ void CudaRasterizer::Rasterizer::backward(
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
-		dL_ddepth
+		dL_ddepth,
 		dL_dall_map,
 		render_geo), debug)
 

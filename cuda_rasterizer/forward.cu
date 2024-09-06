@@ -300,12 +300,12 @@ renderCUDA(
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
-    uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	uint32_t pix_id = W * pix.y + pix.x;
-	float2 pixf = { (float)pix.x, (float)pix.y };
+    const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
 	const float2 ray = { (pixf.x - cx) / focal_x, (pixf.y - cy) / focal_y };
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;

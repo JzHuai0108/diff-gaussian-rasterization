@@ -1,4 +1,4 @@
-///*
+/*
  * Copyright (C) 2023, Inria
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
@@ -468,8 +468,8 @@ __global__ void preprocessCUDA(
 
 	float a = proj_raw[0];
 	float b = proj_raw[5];
-	float c = proj_raw[10];
-	float d = proj_raw[14];
+	// float c = proj_raw[10];
+	// float d = proj_raw[14];
 	float e = proj_raw[11];
 
 	SE3 T_CW(viewmatrix);
@@ -558,6 +558,36 @@ __device__ void render_cuda_reduce_sum(group_t g, Lists... lists) {
   }
 }
 
+template<int N>
+struct Point {
+    float data[N];  // Array of N floats
+
+	Point() = default;
+
+    // Constructor to initialize from float array
+    __device__ __host__ Point(const float b[N]) {
+        for (int i = 0; i < N; ++i) {
+            data[i] = b[i];
+        }
+    }
+
+    // Overload += operator for Point
+    __device__ __host__ Point<N>& operator+=(const Point<N>& other) {
+        for (int i = 0; i < N; ++i) {
+            data[i] += other.data[i];
+        }
+        return *this;
+    }
+
+    // Access elements
+    __device__ __host__ float& operator[](int i) {
+        return data[i];
+    }
+
+    __device__ __host__ const float& operator[](int i) const {
+        return data[i];
+    }
+};
 
 // Backward version of the rendering procedure.
 template <uint32_t C,uint32_t MAP_N>
@@ -589,6 +619,7 @@ renderCUDA(
 	float* __restrict__ dL_dall_map,
 	const bool render_geo)
 {
+	typedef Point<MAP_N> floatN;
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
 	auto tid = block.thread_rank();
@@ -599,7 +630,7 @@ renderCUDA(
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
 	const float2 pixf = { (float)pix.x, (float)pix.y };
-	const float2 ray = { (pixf.x - W * 0.5) / fx, (pixf.y - H * 0.5) / fy };
+	const float2 ray = { (pixf.x - W * 0.5f) / fx, (pixf.y - H * 0.5f) / fy };
 
 	const bool inside = pix.x < W&& pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -617,8 +648,10 @@ renderCUDA(
 	__shared__ float collected_all_maps[MAP_N * BLOCK_SIZE];
 
 	__shared__ float2 dL_dmean2D_shared[BLOCK_SIZE];
+	__shared__ float2 dL_dmean2D_abs_shared[BLOCK_SIZE];
 	__shared__ float3 dL_dcolors_shared[BLOCK_SIZE];
 	__shared__ float dL_ddepths_shared[BLOCK_SIZE];
+	__shared__ floatN dL_dall_map_shared[BLOCK_SIZE];
 	__shared__ float dL_dopacity_shared[BLOCK_SIZE];
 	__shared__ float4 dL_dconic2D_shared[BLOCK_SIZE];
 
@@ -758,6 +791,8 @@ renderCUDA(
 			dL_dcolors_shared[tid].z = local_dL_dcolors[2];
 
 			if (render_geo) {
+				float local_dL_dall_map[MAP_N];
+				#pragma unroll
 				for (int ch = 0; ch < MAP_N; ch++)
 				{
 					const float c = collected_all_maps[ch * BLOCK_SIZE + j];
@@ -767,24 +802,17 @@ renderCUDA(
 
 					const float dL_dchannel = dL_dout_all_map[ch];
 					dL_dalpha += (c - accum_all_map[ch]) * dL_dchannel;
-					// Update the gradients w.r.t. color of the Gaussian. 
-					// Atomic, since this pixel is just one of potentially
-					// many that were affected by this Gaussian.
-					atomicAdd(&(dL_dall_map[global_id * MAP_N + ch]), skip ? 0.0f : dchannel_dcolor * dL_dchannel);
+					local_dL_dall_map[ch] = skip ? 0.0f : dchannel_dcolor * dL_dchannel;
 				}
-                // the above geometric channels have included depth, we just fill the values for depths.
-                const float depth = collected_depths[j];
-			    accum_rec_depth = skip ? accum_rec_depth : last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
-			    last_depth = skip ? last_depth : depth;
-			    // dL_dalpha += (depth - accum_rec_depth) * dL_dpixel_depth; // This has been done for depth in the above geometric channels.
-			    dL_ddepths_shared[tid] = skip ? 0.f : dchannel_dcolor * dL_dpixel_depth;
-			} else { // only render depth
-			    const float depth = collected_depths[j];
-			    accum_rec_depth = skip ? accum_rec_depth : last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
-			    last_depth = skip ? last_depth : depth;
-			    dL_dalpha += (depth - accum_rec_depth) * dL_dpixel_depth;
-			    dL_ddepths_shared[tid] = skip ? 0.f : dchannel_dcolor * dL_dpixel_depth;
-            }
+				dL_dall_map_shared[tid] = floatN{local_dL_dall_map};
+			}
+
+			const float depth = collected_depths[j];
+			accum_rec_depth = skip ? accum_rec_depth : last_alpha * last_depth + (1.f - last_alpha) * accum_rec_depth;
+			last_depth = skip ? last_depth : depth;
+			dL_dalpha += (depth - accum_rec_depth) * dL_dpixel_depth;
+			dL_ddepths_shared[tid] = skip ? 0.f : dchannel_dcolor * dL_dpixel_depth;
+
 			dL_dalpha *= T;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = skip ? last_alpha : alpha;
@@ -807,31 +835,36 @@ renderCUDA(
 
 			dL_dmean2D_shared[tid].x = skip ? 0.f : dL_dG * dG_ddelx * ddelx_dx;
 			dL_dmean2D_shared[tid].y = skip ? 0.f : dL_dG * dG_ddely * ddely_dy;
+			dL_dmean2D_abs_shared[tid].x = skip ? 0.f : fabs(dL_dG * dG_ddelx * ddelx_dx);
+			dL_dmean2D_abs_shared[tid].y = skip ? 0.f : fabs(dL_dG * dG_ddely * ddely_dy);
 			dL_dconic2D_shared[tid].x = skip ? 0.f : -0.5f * gdx * d.x * dL_dG;
 			dL_dconic2D_shared[tid].y = skip ? 0.f : -0.5f * gdx * d.y * dL_dG;
 			dL_dconic2D_shared[tid].w = skip ? 0.f : -0.5f * gdy * d.y * dL_dG;
 			dL_dopacity_shared[tid] = skip ? 0.f : G * dL_dalpha;
-            
-			atomicAdd(&dL_dmean2D_abs[global_id].x, skip ? 0.f : fabs(dL_dG * dG_ddelx * ddelx_dx));  // TODO: should we remove dL_dmean2D_abs? If not, use dL_dmean2D_abs_shared?
-			atomicAdd(&dL_dmean2D_abs[global_id].y, skip ? 0.f : fabs(dL_dG * dG_ddely * ddely_dy));
 
 			render_cuda_reduce_sum(block, 
 				dL_dmean2D_shared,
+				dL_dmean2D_abs_shared,
 				dL_dconic2D_shared,
 				dL_dopacity_shared,
-				dL_dcolors_shared, 
-				dL_ddepths_shared
-			);	
+				dL_dcolors_shared,
+				dL_ddepths_shared,
+				dL_dall_map_shared
+			);
 			
 			if (tid == 0) {
 				float2 dL_dmean2D_acc = dL_dmean2D_shared[0];
+				float2 dL_dmean2D_abs_acc = dL_dmean2D_abs_shared[0];
 				float4 dL_dconic2D_acc = dL_dconic2D_shared[0];
 				float dL_dopacity_acc = dL_dopacity_shared[0];
 				float3 dL_dcolors_acc = dL_dcolors_shared[0];
 				float dL_ddepths_acc = dL_ddepths_shared[0];
+				floatN dL_dall_map_acc = dL_dall_map_shared[0];
 
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dmean2D_acc.x);
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dmean2D_acc.y);
+				atomicAdd(&dL_dmean2D_abs[global_id].x, dL_dmean2D_abs_acc.x);
+				atomicAdd(&dL_dmean2D_abs[global_id].y, dL_dmean2D_abs_acc.y);
 				atomicAdd(&dL_dconic2D[global_id].x, dL_dconic2D_acc.x);
 				atomicAdd(&dL_dconic2D[global_id].y, dL_dconic2D_acc.y);
 				atomicAdd(&dL_dconic2D[global_id].w, dL_dconic2D_acc.w);
@@ -840,6 +873,11 @@ renderCUDA(
 				atomicAdd(&dL_dcolors[global_id * C + 1], dL_dcolors_acc.y);
 				atomicAdd(&dL_dcolors[global_id * C + 2], dL_dcolors_acc.z);
 				atomicAdd(&dL_ddepths[global_id], dL_ddepths_acc);
+				if (render_geo) {
+					for (int ch = 0; ch < MAP_N; ch++) {
+						atomicAdd(&dL_dall_map[global_id * MAP_N + ch], dL_dall_map_acc[ch]);
+					}
+				}
 			}
 		}
 	}
@@ -969,7 +1007,7 @@ void BACKWARD::render(
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_ddepths
+		dL_ddepths,
 		dL_dall_map,
 		render_geo
 		);
