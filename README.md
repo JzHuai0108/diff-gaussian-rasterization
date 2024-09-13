@@ -7,6 +7,19 @@ This software is used as the rasterization engine in the paper ["Gaussian Splatt
 
 The code is built on top of the original [Differential Gaussian Rasterization](https://github.com/graphdeco-inria/diff-gaussian-rasterization) used in "3D Gaussian Splatting for Real-Time Rendering of Radiance Fields".
 
+## Build (only for debugging)
+For cuda debugging, use the commands to build
+```
+mkdir build && cd build
+cmake .. -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc # Do not use the nvcc in a conda venv
+make
+```
+
+## Install
+```
+pip install diff-gaussian-rasterization
+```
+
 If you can make use of it in your own research, please be so kind to cite both papers.
 
 
