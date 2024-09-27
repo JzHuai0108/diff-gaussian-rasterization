@@ -429,7 +429,7 @@ __global__ void preprocessCUDA(
 	const float* proj,
 	const float *proj_raw,
 	const glm::vec3* campos,
-	const float3* dL_dmean2D,
+	const float4* dL_dmean2D,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
 	float *dL_ddepth,
@@ -575,7 +575,7 @@ renderCUDA(
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixels_depth,
-	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
@@ -606,7 +606,7 @@ renderCUDA(
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float collected_depths[BLOCK_SIZE];
 
-	__shared__ float2 dL_dmean2D_shared[BLOCK_SIZE];
+	__shared__ float4 dL_dmean2D_shared[BLOCK_SIZE];
 	__shared__ float3 dL_dcolors_shared[BLOCK_SIZE];
 	__shared__ float dL_ddepths_shared[BLOCK_SIZE];
 	__shared__ float dL_dopacity_shared[BLOCK_SIZE];
@@ -751,6 +751,8 @@ renderCUDA(
 
 			dL_dmean2D_shared[tid].x = skip ? 0.f : dL_dG * dG_ddelx * ddelx_dx;
 			dL_dmean2D_shared[tid].y = skip ? 0.f : dL_dG * dG_ddely * ddely_dy;
+			dL_dmean2D_shared[tid].z = skip ? 0.f : fabs(dL_dG * dG_ddelx * ddelx_dx);
+			dL_dmean2D_shared[tid].w = skip ? 0.f : fabs(dL_dG * dG_ddely * ddely_dy);
 			dL_dconic2D_shared[tid].x = skip ? 0.f : -0.5f * gdx * d.x * dL_dG;
 			dL_dconic2D_shared[tid].y = skip ? 0.f : -0.5f * gdx * d.y * dL_dG;
 			dL_dconic2D_shared[tid].w = skip ? 0.f : -0.5f * gdy * d.y * dL_dG;
@@ -765,7 +767,7 @@ renderCUDA(
 			);	
 			
 			if (tid == 0) {
-				float2 dL_dmean2D_acc = dL_dmean2D_shared[0];
+				float4 dL_dmean2D_acc = dL_dmean2D_shared[0];
 				float4 dL_dconic2D_acc = dL_dconic2D_shared[0];
 				float dL_dopacity_acc = dL_dopacity_shared[0];
 				float3 dL_dcolors_acc = dL_dcolors_shared[0];
@@ -773,6 +775,8 @@ renderCUDA(
 
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dmean2D_acc.x);
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dmean2D_acc.y);
+				atomicAdd(&dL_dmean2D[global_id].z, dL_dmean2D_acc.z);
+				atomicAdd(&dL_dmean2D[global_id].w, dL_dmean2D_acc.w);
 				atomicAdd(&dL_dconic2D[global_id].x, dL_dconic2D_acc.x);
 				atomicAdd(&dL_dconic2D[global_id].y, dL_dconic2D_acc.y);
 				atomicAdd(&dL_dconic2D[global_id].w, dL_dconic2D_acc.w);
@@ -802,7 +806,7 @@ void BACKWARD::preprocess(
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
 	const glm::vec3* campos,
-	const float3* dL_dmean2D,
+	const float4* dL_dmean2D,
 	const float* dL_dconic,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
@@ -848,7 +852,7 @@ void BACKWARD::preprocess(
 		projmatrix,
 		projmatrix_raw,
 		campos,
-		(float3*)dL_dmean2D,
+		(float4*)dL_dmean2D,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_ddepth,
@@ -873,7 +877,7 @@ void BACKWARD::render(
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_dpixels_depth,
-	float3* dL_dmean2D,
+	float4* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,

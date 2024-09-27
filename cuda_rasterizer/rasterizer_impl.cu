@@ -220,6 +220,7 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_opacity,
 	int* radii,
 	int* n_touched,
+	float* gs_w,
 	bool debug)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
@@ -337,7 +338,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.depths,
 		out_depth, 
 		out_opacity,
-		n_touched
+		n_touched,
+		gs_w
     ), debug)
 
 	return num_rendered;
@@ -416,7 +418,7 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.n_contrib,
 		dL_dpix,
 		dL_dpix_depth,
-		(float3*)dL_dmean2D,
+		(float4*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor,
@@ -442,7 +444,7 @@ void CudaRasterizer::Rasterizer::backward(
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
 		(glm::vec3*)campos,
-		(float3*)dL_dmean2D,
+		(float4*)dL_dmean2D,
 		dL_dconic,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,

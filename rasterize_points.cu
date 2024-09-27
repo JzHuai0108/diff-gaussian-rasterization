@@ -32,7 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -71,6 +71,7 @@ RasterizeGaussiansCUDA(
   torch::Tensor n_touched = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   torch::Tensor out_depth = torch::full({1, H, W}, 0.0, float_opts);
   torch::Tensor out_opaticy = torch::full({1, H, W}, 0.0, float_opts);
+  torch::Tensor gs_w = torch::full({P}, 0.0, float_opts);
 
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -116,9 +117,10 @@ RasterizeGaussiansCUDA(
 		out_opaticy.contiguous().data<float>(),
 		radii.contiguous().data<int>(),
 		n_touched.contiguous().data<int>(),
+		gs_w.contiguous().data<float>(),
         debug);
   }
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched);
+  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer, out_depth, out_opaticy, n_touched, gs_w);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -158,7 +160,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   }
 
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
-  torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
+  torch::Tensor dL_dmeans2D = torch::zeros({P, 4}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
   torch::Tensor dL_ddepths = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
